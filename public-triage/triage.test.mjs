@@ -287,7 +287,9 @@ test('Jev validates the pinned model, answer shape and probability distribution'
     (a, model = 'jev-1.13.0') =>
     async () => ({ ok: true, json: async () => ({ model, answers: { decision: a } }) })
   assert.equal(await judge({}, q, 'fixture', mock(answer)), 'bug')
-  assert.equal(await judge({}, q, 'fixture', mock({ ...answer, confidence: 0.8 })), 'other')
+  assert.equal(await judge({}, q, 'fixture', mock({ ...answer, confidence: 0.8 })), 'abstain')
+  const sure = { ...answer, choice: 'other', probabilities: { bug: 0.04, other: 0.96 } }
+  assert.equal(await judge({}, q, 'fixture', mock(sure)), 'other')
   await assert.rejects(judge({}, q, 'fixture', mock(answer, 'unknown')), /envelope/)
   await assert.rejects(judge({}, q, 'fixture', mock({ ...answer, probabilities: { bug: 1 } })), /choice/)
   await assert.rejects(
@@ -417,4 +419,88 @@ test('abstain on incomplete PR file lists or a changed revision', async () => {
   })
   await changed.run({ key: 'fixture', decide: async () => 'bug' })
   assert.deepEqual(changed.writes, [])
+})
+
+test('an unsure Jev keeps the title label; a confident other still adds none', async () => {
+  const items = [
+    bug(1, { title: 'fix(store): refuse a write it cannot move', labels: [], pull_request: {} }),
+    bug(2, { title: 'fix: tests only', labels: [], pull_request: {} }),
+    bug(3, { title: 'question: why do the docs disagree?', labels: [] }),
+    bug(4, { title: 'Rapid Send submits a draft twice', labels: [] }),
+  ]
+  const f = fixture(items, { repoLabels: ['bug', 'question'] })
+  await f.run({
+    key: 'fixture',
+    decide: async (state) => (state.title === 'fix: tests only' ? 'other' : 'abstain'),
+  })
+  assert.deepEqual(
+    f.writes.map((w) => [w.path, w.data.labels]),
+    [
+      ['/issues/1/labels', ['bug']],
+      ['/issues/3/labels', ['question']],
+    ],
+  )
+  assert.ok(f.logs.includes('#2 skip model other'))
+  assert.ok(f.logs.includes('#4 skip model abstain'))
+  assert.match(f.logs.at(-1), /skipped \{"model other":1,"model abstain":1\}/)
+})
+
+test('items without a type label are scanned first, newest included, then the rest rotates', async () => {
+  const labeled = Array.from({ length: 100 }, (_, n) => bug(n + 1, { comments: 1 }))
+  const fresh = [101, 102, 103].map((n) => bug(n, { title: 'fix: new defect ' + n, labels: [] }))
+  for (const day of [0, 1, 2, 3]) {
+    const f = fixture([...labeled, ...fresh])
+    await f.run({ day })
+    assert.deepEqual(
+      f.writes.map((w) => w.path),
+      ['/issues/101/labels', '/issues/102/labels', '/issues/103/labels'],
+      'day ' + day,
+    )
+    assert.match(f.logs.at(-1), /scanned 48\/103/)
+  }
+  const many = Array.from({ length: 60 }, (_, n) =>
+    bug(n + 1, { title: 'fix: defect ' + n, labels: [] }),
+  )
+  const reached = new Set()
+  for (const day of [0, 1]) {
+    const f = fixture(many)
+    await f.run({ day })
+    for (const w of f.writes) reached.add(w.path)
+  }
+  assert.equal(reached.size, 60)
+})
+
+test('a failing model call is no decision for that item and the run continues', async () => {
+  const items = [
+    bug(1, { title: 'Parser drops a record', labels: [] }),
+    bug(2, { title: 'fix: retry DNS', labels: [] }),
+    bug(3, { title: 'Exporter loses a field', labels: [] }),
+  ]
+  const f = fixture(items)
+  await f.run({
+    key: 'fixture',
+    decide: async (state) => {
+      if (state.title === 'Parser drops a record') throw new Error('Jev HTTP 503')
+      return 'bug'
+    },
+  })
+  assert.deepEqual(
+    f.writes.map((w) => w.path),
+    ['/issues/2/labels', '/issues/3/labels'],
+  )
+  assert.ok(f.logs.includes('#1 model error: Jev HTTP 503'))
+  const broken = fixture(items)
+  await assert.rejects(
+    broken.run({
+      key: 'fixture',
+      decide: async () => {
+        throw new Error('Jev HTTP 401')
+      },
+    }),
+    /Jev failed 4 of 4 calls/,
+  )
+  assert.deepEqual(
+    broken.writes.map((w) => w.path),
+    ['/issues/2/labels'],
+  )
 })

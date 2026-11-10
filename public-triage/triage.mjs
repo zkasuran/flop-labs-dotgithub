@@ -84,7 +84,9 @@ export async function judge(state, question, key, fetcher = fetch) {
     scores[answer.choice] !== Math.max(...values)
   )
     throw new Error('Invalid Jev choice')
-  return scores[answer.choice] >= 0.9 && answer.confidence >= 0.9 ? answer.choice : 'other'
+  // Below the bar Jev has not decided. Keep that distinct from a confident "other" so a caller can
+  // fall back to the title convention without overriding a deliberate "not a fix".
+  return scores[answer.choice] >= 0.9 && answer.confidence >= 0.9 ? answer.choice : 'abstain'
 }
 
 const classify = {
@@ -248,9 +250,24 @@ export async function sweep({
   const list = (path) => request(base + path, { pages: true })
   const rows = list('/issues?state=open&sort=created&direction=asc&per_page=100')
   const labels = new Set(list('/labels?per_page=100').map((l) => l.name))
+  // Labels are the common work, so items without a type decision come first. Rotate inside each
+  // group so every item is reached: with 48 or fewer unlabeled items all of them are seen daily.
+  const unlabeled = (row) => !knownKind(row) && !names(row).some((l) => l.startsWith('type:'))
+  const rotate = (group, n) => {
+    const at = group.length ? (day * 48) % group.length : 0
+    return Array.from({ length: Math.min(n, group.length) }, (_, i) => group[(at + i) % group.length])
+  }
+  const fresh = rotate(
+    rows.filter((row) => unlabeled(row) && !protectedThread(row)),
+    48,
+  )
+  const seen = new Set(fresh)
   const size = Math.min(48, rows.length)
-  const start = rows.length ? (day * 48) % rows.length : 0
-  const window = Array.from({ length: size }, (_, i) => rows[(start + i) % rows.length]).sort(
+  const rest = rotate(
+    rows.filter((row) => !seen.has(row)),
+    size - fresh.length,
+  )
+  const window = [...fresh, ...rest].sort(
     (a, b) => a.number - b.number,
   )
   const keep = new Set(),
@@ -260,6 +277,27 @@ export async function sweep({
     timeline.some((e) =>
       ['reopened', 'unmarked_as_duplicate', 'connected', 'cross-referenced'].includes(e.event),
     )
+  const started = Date.now()
+  let modelErrors = 0,
+    modelCalls = 0
+  const skips = {}
+  const skip = (item, reason) => {
+    skips[reason] = (skips[reason] ?? 0) + 1
+    log('#' + item.number + ' skip ' + reason)
+  }
+  // A failed, malformed or late answer counts as no decision for that item. The job has a 30 minute
+  // limit, so model calls stop after 20 minutes and the rest of the window still gets title rules.
+  const ask = async (item, state, question, unsure) => {
+    if (Date.now() - started > 20 * 60_000) return unsure
+    modelCalls++
+    try {
+      return await decide(state, question, key)
+    } catch (error) {
+      modelErrors++
+      log('#' + item.number + ' model error: ' + String(error.message ?? error).slice(0, 120))
+      return unsure
+    }
+  }
   let closures = 0,
     added = 0,
     comparisons = 0
@@ -296,16 +334,28 @@ export async function sweep({
       ) {
         if (pr(item)) {
           prContext = prLabelContext(pullPath, item, request)
-          if (!prContext) continue
+          if (!prContext) {
+            skip(item, 'incomplete PR file list')
+            continue
+          }
         }
+        const titled = kind
         const state = prContext?.state ?? { ...textOf(item), itemType: 'issue' }
-        kind = await decide(state, classify, key)
-        if (!prContext && kind === 'other' && available('bug', labels)) {
-          const reviewed = await decide(state, checkReportedDefect, key)
+        kind = await ask(item, state, classify, 'abstain')
+        if (!prContext && (kind === 'other' || kind === 'abstain') && available('bug', labels)) {
+          const reviewed = await ask(item, state, checkReportedDefect, 'abstain')
           if (reviewed === 'bug') kind = 'bug'
         }
-      }
+        // Jev overrides a title only when it is sure. An unsure answer keeps the title's label,
+        // as keyless mode would; a confident "other" (for example a tests-only PR) still adds none.
+        if (kind === 'abstain' && titled) kind = titled
+        if (kind === 'abstain' || kind === 'other') skip(item, 'model ' + kind)
+      } else if (!kind && substantive(item).length > 12_000) skip(item, 'body over 12000 characters')
       const label = available(kind, labels)
+      if (kind && kind !== 'other' && kind !== 'abstain' && !label)
+        skip(item, 'no local ' + kind + ' label')
+      if (label && events().some((e) => e.event === 'unlabeled' && e.label.name === label))
+        skip(item, 'label was removed by a person')
       if (
         label &&
         !events().some((e) => e.event === 'unlabeled' && e.label.name === label) &&
@@ -404,7 +454,8 @@ export async function sweep({
         if (!exact) {
           comparisons++
           if (
-            (await decide({ report: textOf(item), original: textOf(other) }, equivalent, key)) !== true
+            (await ask(item, { report: textOf(item), original: textOf(other) }, equivalent, false)) !==
+            true
           )
             continue
         }
@@ -440,8 +491,17 @@ export async function sweep({
       ', labels ' +
       added +
       ', closures ' +
-      closures,
+      closures +
+      ', skipped ' +
+      JSON.stringify(skips) +
+      ', model calls ' +
+      modelCalls +
+      ', model errors ' +
+      modelErrors,
   )
+  // Label decisions above are already applied. Fail afterwards so a broken key or API is noticed.
+  if (modelErrors >= 3 && modelErrors * 2 >= modelCalls)
+    throw new Error('Jev failed ' + modelErrors + ' of ' + modelCalls + ' calls')
   return { added, closures }
 }
 
